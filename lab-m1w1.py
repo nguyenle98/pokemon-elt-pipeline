@@ -5,6 +5,7 @@ import pyarrow.parquet as pq
 import pyarrow as pa
 import os
 import pdb
+from time import sleep
 
 def extract_data(offset=0, limit=10, file_path="pokemon_data.parquet"):
 
@@ -22,11 +23,12 @@ def extract_data(offset=0, limit=10, file_path="pokemon_data.parquet"):
     if not results:
         return file_path, offset  # No more data to fetch
     
-    # Fetch Pokemon names
+    # Fetch Pokemon names and url
     pokemon_data = []
     for pokemon in results:
         pokemon_data.append({
-            "name": pokemon["name"]  # Only store name as unique identifier
+            "name": pokemon["name"],
+            "url": pokemon["url"]  # Ensure URL is saved
         })
     
     # Convert results to DataFrame
@@ -56,109 +58,107 @@ df = pd.read_parquet(file_path)
 print(df.head())
 """
 
+def load_data(file_path, new_last_id):
+    conn = duckdb.connect("pokedex.db")
 
-def load_data(parquet_file="pokemon_data.parquet", db_file="pokedex.db", conn=None):
-    """
-    Loads extracted Pokémon data from a Parquet file into DuckDB and tracks the last extracted Pokémon ID.
-    
-    Args:
-        parquet_file (str): Path to the Parquet file.
-        db_file (str): Path to the DuckDB database file.
-    """
-    if conn is None:
-        conn = duckdb.connect(db_file)
-    
-    # Create pokedex table if it doesn't exist
+    conn.execute("DROP TABLE IF EXISTS pokedex")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS pokedex (
-            name TEXT PRIMARY KEY
+            last_id INTEGER, 
+            pokemon_id INTEGER, 
+            name TEXT, 
+            url TEXT
         )
     """)
-    
-    # Create metadata table if it doesn't exist
+
+    # Insert data into the table from Parquet
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS metadata (
-            key TEXT PRIMARY KEY,
-            value TEXT
-        )
-    """
-    )
-    
-    # Get last extracted Pokémon name
-    last_name = conn.execute("SELECT value FROM metadata WHERE key = 'last_extracted_name'").fetchone()
-    last_name = last_name[0] if last_name else None
-    
-    # Load new data from Parquet
-    df = pd.read_parquet(parquet_file)
-    if last_name:
-        df = df[df["name"] > last_name]  # Filter out already loaded data
-    
-    if not df.empty:
-        # Insert new data into DuckDB
-        conn.execute("INSERT INTO pokedex SELECT * FROM df")
-        
-        # Update metadata table with the new last name
-        new_last_name = df["name"].max()  # Assuming names are ordered
-        conn.execute("""
-            INSERT INTO metadata (key, value) VALUES ('last_extracted_name', ?) 
-            ON CONFLICT(key) DO UPDATE SET value = excluded.value
-        """, (new_last_name,))
+        INSERT INTO pokedex (last_id, pokemon_id, name, url) 
+        SELECT 
+            ? as last_id,
+            CAST(regexp_extract(url, '/pokemon/(\d+)/', 1) AS INTEGER) as pokemon_id,
+            name,
+            url 
+        FROM read_parquet(?)
+    """, [new_last_id, file_path])
+
+    # Preview loaded data to check it
+    preview_df = conn.execute("""
+        SELECT * 
+        FROM pokedex 
+        WHERE last_id = ? 
+        LIMIT 5
+    """, [new_last_id]).fetchdf()
+
+    print("Preview loaded data: ", preview_df)
+
+    # Ensure metadata table exists
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT)
+    """)
+
+    # Update the last extracted ID in the metadata table
+    conn.execute("""
+        INSERT INTO metadata (key, value) 
+        VALUES ('last_extracted_id', ?) 
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+    """, [new_last_id])
+
+    print("Data loaded successfully")
     
     return conn
 
 
-def transform_data(conn, db_file="pokedex.db"):
+
+def transform_data(conn):
     """
-    Performs aggregations on Pokémon data and stores the results in a pokemon_stats table.
+    Transform data from the raw pokedex table and create aggregated statistics.
+    This function:
+    1. Creates a new table 'pokemon_stats' with aggregated metrics.
+    2. Calculates total count of pokemon, minimum and maximum pokemon IDs.
+    3. Prints a preview of the transformed data.
     
-    Args:
-        db_file (str): Path to the DuckDB database file.
+    Returns:
+        str: Name of the created table ('pokemon_stats')
     """
-    # Create pokemon_stats table if it doesn't exist
+    # Create pokemon_stats table with aggregated statistics
     conn.execute("""
-        CREATE TABLE IF NOT EXISTS pokemon_stats (
-            total_pokemon INTEGER,
-            first_pokemon_name TEXT,
-            last_pokemon_name TEXT
-        )
+        CREATE OR REPLACE TABLE pokemon_stats AS
+        SELECT 
+            COUNT(*) AS total_pokemon, 
+            MIN(pokemon_id) AS first_id, 
+            MAX(pokemon_id) AS last_id
+        FROM pokedex
     """)
     
-    # Calculate statistics
-    stats = conn.execute("""
-        SELECT COUNT(*) AS total_pokemon, MIN(name) AS first_pokemon_name, MAX(name) AS last_pokemon_name FROM pokedex
-    """).fetchone()
+    # Preview the transformed data by fetching the first few rows
+    df = conn.execute("SELECT * FROM pokemon_stats").fetchdf()
+    print("Preview transformed data: ", df)
     
-    # Insert or update the pokemon_stats table
-    conn.execute("""
-        INSERT INTO pokemon_stats (total_pokemon, first_pokemon_name, last_pokemon_name)
-        VALUES (?, ?, ?)
-        ON CONFLICT DO UPDATE SET
-        total_pokemon = excluded.total_pokemon,
-        first_pokemon_name = excluded.first_pokemon_name,
-        last_pokemon_name = excluded.last_pokemon_name
-    """, stats)
-    
-    return conn
+    # Return the name of the created table
+    return "pokemon_stats"
+
 
 def main():
-    # Create a DuckDB connection
-    conn = duckdb.connect("pokedex.db")
+    print(" Extracting data...")
+    file_path_1, new_last_id_1 = extract_data(limit=10, offset=0)  # First extraction
+    print(f"Extracted data from offset {0} to {new_last_id_1}")
     
-    try:
-        # Extract data twice to generate two Parquet files
-        file_path, offset = extract_data(offset=0, limit=10)
-        file_path, offset = extract_data(offset=offset, limit=10)  # Incremental extraction
-        
-        # Load both files into DuckDB
-        conn = load_data(parquet_file=file_path, conn=conn)
-        conn = load_data(parquet_file=file_path, conn=conn)  # Load the second file
-        
-        # Transform the data
-        conn = transform_data(conn, db_file="pokedex.db")
-        
-    finally:
-        # Close the connection
-        conn.close()
+    print(" Extracting more data...")
+    file_path_2, new_last_id_2 = extract_data(limit=10, offset=new_last_id_1)  # Second extraction
+    print(f"Extracted data from offset {new_last_id_1} to {new_last_id_2}")
+    
+    print("Loading data...")
+    load_data(file_path_1, new_last_id_1)  # Load the first batch
+    load_data(file_path_2, new_last_id_2)  # Load the second batch
+    
+    print("Transforming data...")
+    conn = duckdb.connect("pokedex.db")  # Ensure you have the connection ready
+    transform_data(conn)  # Transform the data in the database
+    
+    print("ELT Pipeline completed successfully!")
 
-    print("ELT Pipeline executed successfully.")
-#Show me the result, the table in the end"
+
+if __name__ == "__main__":
+    main()
+
